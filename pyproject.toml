@@ -1,0 +1,33 @@
+[project]
+name = "kaspersky-ksc-mcp-server"
+version = "0.1.0"
+description = "Read-only MCP Server for Kaspersky Security Center Open API (ohne KlAkOAPI-Abhaengigkeit)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=2,<3",
+  "httpx>=0.27.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+  "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ksc_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100

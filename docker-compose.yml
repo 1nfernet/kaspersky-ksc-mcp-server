@@ -1,0 +1,11 @@
+services:
+  ksc-mcp:
+    build: .
+    image: ksc-mcp:0.1.0
+    ports:
+      # Localhost-only: the HTTP server has no auth of its own (see README).
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
