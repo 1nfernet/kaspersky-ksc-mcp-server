@@ -16,7 +16,15 @@ async def get_host_details(
     include_tags: bool = True,
 ) -> dict[str, Any]:
     """Attribute + Produkte + Tags eines Hosts in einer Antwort buendeln."""
-    host = await hosts_tools.get_host(client, hostname, fields)
+    # INSTANCEID nur dann mitladen, wenn der Aufrufer sie nicht selbst will —
+    # sie wird danach wieder entfernt, damit die Antwort stabil bleibt.
+    # Hinweis: szwHostId=KLHST_INSTANCEID ist doku-belegt, aber noch nie gegen
+    # einen echten KSC verifiziert (Live-Smoke ausstehend).
+    added_id = include_tags and (fields is None or "KLHST_INSTANCEID" not in fields)
+    info_fields = list(fields) if fields else list(hosts_tools.DEFAULT_HOST_FIELDS)
+    if added_id and "KLHST_INSTANCEID" not in info_fields:
+        info_fields.append("KLHST_INSTANCEID")
+    host = (await hosts_tools.get_host(client, hostname, info_fields)).get("host", {})
 
     products: Any = None
     if include_products:
@@ -25,11 +33,15 @@ async def get_host_details(
     tags: Any = None
     host_id: str | None = None
     if include_tags:
-        tag_res = await tags_tools.get_host_tags(client, hostname=hostname)
+        hid = host.pop("KLHST_INSTANCEID", None) if added_id else host.get("KLHST_INSTANCEID")
+        if hid:
+            tag_res = await tags_tools.get_host_tags(client, host_id=str(hid))
+        else:
+            tag_res = await tags_tools.get_host_tags(client, hostname=hostname)
         tags = tag_res.get("tags")
         host_id = tag_res.get("host_id")
 
-    out: dict[str, Any] = {"host": host.get("host")}
+    out: dict[str, Any] = {"host": host}
     if host_id:
         out["host_id"] = host_id
     if include_products:

@@ -60,6 +60,16 @@ def test_config_rejects_invalid_port_and_timeout():
         KscConfig.from_env({"KSC_HOST": "h", "KSC_USER": "u", "KSC_TIMEOUT": "soon"})
 
 
+async def test_ksc_unreachable_surfaces_without_crash():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        c = KscClient(_cfg(), http=http)
+        with pytest.raises(httpx.ConnectError):
+            await c.call("HostGroup.GroupIdGroups", {})
+
+
 async def test_login_and_call_ok():
     routes = {
         "Session.StartSession": {"PxgRetVal": "SID123"},

@@ -110,9 +110,29 @@ async def test_get_host_details_bundle():
         c = KscClient(_cfg(), http=http)
         out = await details_tools.get_host_details(c, "PC1")
         assert out["host"]["KLHST_WKS_HOSTNAME"] == "PC1"
+        assert "KLHST_INSTANCEID" not in out["host"]  # internals nicht leaken
         assert out["host_id"] == "GUID-123"
         assert out["products"] == {"KES": "11.0"}
         assert out["tags"][0]["KLHST_TagValue"] == "Server"
+
+
+async def test_get_host_details_single_hostinfo_call():
+    seen: list[dict] = []
+
+    def rec(request: httpx.Request) -> httpx.Response:
+        if request.url.path.rsplit("/", 1)[-1] == "HostGroup.GetHostInfo":
+            import json as _json
+
+            seen.append(_json.loads(request.content.decode()))
+        return _tags_handler(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(rec)
+    ) as http:
+        c = KscClient(_cfg(), http=http)
+        await details_tools.get_host_details(c, "PC1")
+        assert len(seen) == 1  # kein zweiter Lookup für die GUID
+        assert "KLHST_INSTANCEID" in seen[0]["pFields2Return"]
 
 
 async def test_get_host_details_minimal():

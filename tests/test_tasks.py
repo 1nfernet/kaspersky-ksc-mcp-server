@@ -91,6 +91,17 @@ async def test_list_tasks_truncated_when_capped():
         out = await tasks_tools.list_tasks(c, limit=1, offset=0)
         assert out["tasks"] == [{"TSK_DISPLAY_NAME": "T1"}]
         assert out["truncated"] is True
+        assert out["total"] is None  # unbekannt bei Trunkierung, kein Ratespiel
+
+
+async def test_record_list_wraps_single_record():
+    from ksc_mcp.iterators import as_record_list
+
+    single = {"type": "params", "value": {"hostname": "PC1"}}
+    assert as_record_list({"KLCSP_ITERATOR_ARRAY": [single]}) == [{"hostname": "PC1"}]
+    assert as_record_list(single) == [{"hostname": "PC1"}]
+    assert as_record_list([]) == []
+    assert as_record_list({}) == []
 
 
 async def test_get_task_bundle():

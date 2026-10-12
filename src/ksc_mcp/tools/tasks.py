@@ -4,7 +4,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ..iterators import DEFAULT_LIFETIME, fetch_via_event_processing, fetch_via_task_list
+from ..iterators import (
+    DEFAULT_LIFETIME,
+    as_record_list,
+    fetch_via_event_processing,
+    fetch_via_task_list,
+)
 from ..ksc_client import KscClient, decode_value
 
 log = logging.getLogger(__name__)
@@ -106,9 +111,7 @@ async def get_task_host_status(
         rng = await client.call("Tasks.GetHostStatusRecordRange", {
             "strHostIteratorId": iterator_id, "nStart": offset, "nEnd": end,
         })
-        items = decode_value(rng.get("pParHostStatus", {}))
-        if isinstance(items, dict):
-            items = items.get("KLCSP_ITERATOR_ARRAY", [])
+        items = as_record_list(rng.get("pParHostStatus", {}))
         return {"total": total, "items": items, "offset": offset, "limit": limit}
     finally:
         try:

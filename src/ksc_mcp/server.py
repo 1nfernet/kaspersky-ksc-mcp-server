@@ -12,13 +12,16 @@ import argparse
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
+from typing import Any
 
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
+from . import auth as auth_mod
 from .config import KscConfig
-from .ksc_client import KscClient
+from .ksc_client import KscClient, KscError
 from .tools import events as events_tools
 from .tools import host_details as details_tools
 from .tools import hosts as hosts_tools
@@ -40,20 +43,86 @@ _READ_ONLY = ToolAnnotations(
 )
 
 _client: KscClient | None = None
+_config: KscConfig | None = None
+
+
+def get_config() -> KscConfig:
+    global _config
+    if _config is None:
+        load_dotenv()
+        # Im Pro-Request-Modus kommen Credentials per Header; ENV braucht
+        # dann nur Host/Port/TLS/Timeout (kein User/Token-Pflicht).
+        _config = KscConfig.from_env(
+            os.environ, require_auth=not auth_mod.per_request_auth_enabled()
+        )
+        if _config.verify is False:
+            log.warning(
+                "KSC_VERIFY=false — TLS-Zertifikat wird NICHT geprüft "
+                "(selbstsigniertes klserver.cer erwartet)"
+            )
+    return _config
 
 
 def get_client() -> KscClient:
     global _client
     if _client is None:
-        load_dotenv()
-        cfg = KscConfig.from_env(os.environ)
-        if cfg.verify is False:
-            log.warning(
-                "KSC_VERIFY=false — TLS-Zertifikat wird NICHT geprüft "
-                "(selbstsigniertes klserver.cer erwartet)"
-            )
-        _client = KscClient(cfg)
+        _client = KscClient(get_config())
     return _client
+
+
+class KscAuthMiddleware:
+    """Reine ASGI-Middleware: legt X-KSC-*-Header pro Request in ContextVar.
+
+    Kein SDK-Fork: wird auf die von mcp.streamable_http_app() gebaute
+    Starlette-App aufgesetzt. Werte werden nie geloggt.
+    """
+
+    def __init__(self, app: Any):
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        raw = scope.get("headers", [])
+        headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in raw}
+        token = auth_mod.set_request_auth(headers)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            auth_mod.reset_request_auth(token)
+
+
+@asynccontextmanager
+async def use_client() -> Any:
+    """Liefert den KSC-Client für genau diesen Call.
+
+    - Mit Request-Headern: ephemerer Client (eigene Session, danach
+      EndSession + close, kein Reuse über Nutzer hinweg).
+    - Ohne Header: ENV-Singleton — außer KSC_PER_REQUEST_AUTH=1, dann
+      Fail-closed mit klarer Fehlermeldung.
+    """
+    req_auth = auth_mod.current_request_auth()
+    if req_auth is not None:
+        client = KscClient(
+            get_config(),
+            auth_header=req_auth.authorization,
+            vserver_header=req_auth.vserver,
+        )
+        try:
+            yield client
+        finally:
+            try:
+                await client.logout()
+            finally:
+                await client.aclose()
+    else:
+        if auth_mod.per_request_auth_enabled():
+            raise KscError(
+                message="Pro-Request-Auth aktiv (KSC_PER_REQUEST_AUTH=1), "
+                "aber kein X-KSC-Authorization-Header im Request"
+            )
+        yield get_client()
 
 
 @mcp.tool(
@@ -72,7 +141,8 @@ async def ksc_list_groups(
     offset: int = 0,
 ) -> dict:
     """Administrationsgruppen auflisten (lesend, HostGroup.FindGroups)."""
-    return await hosts_tools.list_groups(get_client(), group_filter, fields, limit, offset)
+    async with use_client() as client:
+        return await hosts_tools.list_groups(client, group_filter, fields, limit, offset)
 
 
 @mcp.tool(
@@ -86,7 +156,8 @@ async def ksc_list_groups(
 )
 async def ksc_get_group(group_id: int) -> dict:
     """Eine Administrationsgruppe + direkte Untergruppen lesen."""
-    return await hosts_tools.get_group(get_client(), group_id)
+    async with use_client() as client:
+        return await hosts_tools.get_group(client, group_id)
 
 
 @mcp.tool(
@@ -106,7 +177,8 @@ async def ksc_find_hosts(
     offset: int = 0,
 ) -> dict:
     """Hosts per Filter suchen (lesend, HostGroup.FindHosts)."""
-    return await hosts_tools.find_hosts(get_client(), host_filter, fields, order, limit, offset)
+    async with use_client() as client:
+        return await hosts_tools.find_hosts(client, host_filter, fields, order, limit, offset)
 
 
 @mcp.tool(
@@ -120,7 +192,8 @@ async def ksc_find_hosts(
 )
 async def ksc_get_host(hostname: str, fields: list[str] | None = None) -> dict:
     """Host-Attribute lesen (HostGroup.GetHostInfo)."""
-    return await hosts_tools.get_host(get_client(), hostname, fields)
+    async with use_client() as client:
+        return await hosts_tools.get_host(client, hostname, fields)
 
 
 @mcp.tool(
@@ -134,7 +207,8 @@ async def ksc_get_host(hostname: str, fields: list[str] | None = None) -> dict:
 )
 async def ksc_get_host_products(hostname: str) -> dict:
     """Installierte Produkte eines Hosts lesen."""
-    return await hosts_tools.get_host_products(get_client(), hostname)
+    async with use_client() as client:
+        return await hosts_tools.get_host_products(client, hostname)
 
 
 @mcp.tool(
@@ -148,7 +222,8 @@ async def ksc_get_host_products(hostname: str) -> dict:
 )
 async def ksc_server_status() -> dict:
     """Server-Statistiken lesen (GetStaticInfo/GetInstanceStatistics/GetRunTimeInfo)."""
-    return await server_tools.server_status(get_client())
+    async with use_client() as client:
+        return await server_tools.server_status(client)
 
 
 @mcp.tool(
@@ -169,7 +244,8 @@ async def ksc_srvview_query(
     offset: int = 0,
 ) -> dict:
     """Generischer SrvView-Lesezugriff, z.B. view='UmdmDevices'. Nur lesend."""
-    return await srvview_tools.srvview_query(get_client(), view, view_filter, fields, order, limit, offset)
+    async with use_client() as client:
+        return await srvview_tools.srvview_query(client, view, view_filter, fields, order, limit, offset)
 
 
 @mcp.tool(
@@ -183,7 +259,8 @@ async def ksc_srvview_query(
 )
 async def ksc_get_host_tags(hostname: str | None = None, host_id: str | None = None) -> dict:
     """Tags eines Hosts lesen (HostTagsApi.GetHostTags). hostname oder host_id (GUID) angeben."""
-    return await tags_tools.get_host_tags(get_client(), hostname=hostname, host_id=host_id)
+    async with use_client() as client:
+        return await tags_tools.get_host_tags(client, hostname=hostname, host_id=host_id)
 
 
 @mcp.tool(
@@ -197,7 +274,8 @@ async def ksc_get_host_tags(hostname: str | None = None, host_id: str | None = N
 )
 async def ksc_list_tags() -> dict:
     """Alle vergebenen Tag-Werte lesen (ListTags.GetAllTags, Instanz HostsTags)."""
-    return await tags_tools.list_tags(get_client())
+    async with use_client() as client:
+        return await tags_tools.list_tags(client)
 
 
 @mcp.tool(
@@ -216,9 +294,10 @@ async def ksc_get_host_details(
     include_tags: bool = True,
 ) -> dict:
     """Kompletter Asset-Datensatz: Attribute + Produkte + Tags eines Hosts in einem Call."""
-    return await details_tools.get_host_details(
-        get_client(), hostname, fields, include_products, include_tags
-    )
+    async with use_client() as client:
+        return await details_tools.get_host_details(
+            client, hostname, fields, include_products, include_tags
+        )
 
 
 @mcp.tool(
@@ -243,10 +322,11 @@ async def ksc_list_tasks(
     offset: int = 0,
 ) -> dict:
     """Gruppen-Tasks auflisten (lesend, Tasks.ResetTasksIterator/GetNextTask)."""
-    return await tasks_tools.list_tasks(
-        get_client(), group_id, group_significant, product, version,
-        component, instance, task_name, include_supergroups, limit, offset,
-    )
+    async with use_client() as client:
+        return await tasks_tools.list_tasks(
+            client, group_id, group_significant, product, version,
+            component, instance, task_name, include_supergroups, limit, offset,
+        )
 
 
 @mcp.tool(
@@ -260,7 +340,8 @@ async def ksc_list_tasks(
 )
 async def ksc_get_task(task_id: str) -> dict:
     """Task-Attribute + Settings + Start-Event lesen (GetTask/GetTaskData/GetTaskStartEvent)."""
-    return await tasks_tools.get_task(get_client(), task_id)
+    async with use_client() as client:
+        return await tasks_tools.get_task(client, task_id)
 
 
 @mcp.tool(
@@ -274,7 +355,8 @@ async def ksc_get_task(task_id: str) -> dict:
 )
 async def ksc_get_task_statistics(task_id: str) -> dict:
     """Task-Statistiken lesen (Tasks.GetTaskStatistics2)."""
-    return await tasks_tools.get_task_statistics(get_client(), task_id)
+    async with use_client() as client:
+        return await tasks_tools.get_task_statistics(client, task_id)
 
 
 @mcp.tool(
@@ -295,9 +377,10 @@ async def ksc_get_task_host_status(
     offset: int = 0,
 ) -> dict:
     """Host-Ausfuehrungsstatus eines Tasks lesen (paginiert). state_mask: Bitmaske nach a00179, 0x7F = alle Zustaende."""
-    return await tasks_tools.get_task_host_status(
-        get_client(), task_id, fields, order, state_mask, limit, offset
-    )
+    async with use_client() as client:
+        return await tasks_tools.get_task_host_status(
+            client, task_id, fields, order, state_mask, limit, offset
+        )
 
 
 @mcp.tool(
@@ -313,11 +396,13 @@ async def ksc_get_task_history(
     task_id: str,
     hostname: str = "",
     fields: list[str] | None = None,
+    sort: list[dict] | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
-    """Task-Ausfuehrungshistorie lesen (GetTaskHistory + EventProcessing, paginiert)."""
-    return await tasks_tools.get_task_history(get_client(), task_id, hostname, fields, None, limit, offset)
+    """Task-Ausfuehrungshistorie lesen (GetTaskHistory + EventProcessing, paginiert). sort: [{"Name": <attr>, "Asc": true}]."""
+    async with use_client() as client:
+        return await tasks_tools.get_task_history(client, task_id, hostname, fields, sort, limit, offset)
 
 
 @mcp.tool(
@@ -331,7 +416,8 @@ async def ksc_get_task_history(
 )
 async def ksc_get_tasks_of_host(domain: str, hostname: str) -> dict:
     """Alle Gruppen- und globalen Tasks eines Hosts lesen (Tasks.GetAllTasksOfHost)."""
-    return await tasks_tools.get_tasks_of_host(get_client(), domain, hostname)
+    async with use_client() as client:
+        return await tasks_tools.get_tasks_of_host(client, domain, hostname)
 
 
 @mcp.tool(
@@ -345,7 +431,8 @@ async def ksc_get_tasks_of_host(domain: str, hostname: str) -> dict:
 )
 async def ksc_list_policies(group_id: int, effective: bool = False) -> dict:
     """Policies einer Gruppe lesen (effective=true: wirksame inkl. vererbter Policies)."""
-    return await policies_tools.list_policies(get_client(), group_id, effective)
+    async with use_client() as client:
+        return await policies_tools.list_policies(client, group_id, effective)
 
 
 @mcp.tool(
@@ -359,7 +446,8 @@ async def ksc_list_policies(group_id: int, effective: bool = False) -> dict:
 )
 async def ksc_get_policy(policy_id: int) -> dict:
     """Policy-Daten lesen (Policy.GetPolicyData)."""
-    return await policies_tools.get_policy(get_client(), policy_id)
+    async with use_client() as client:
+        return await policies_tools.get_policy(client, policy_id)
 
 
 @mcp.tool(
@@ -373,7 +461,8 @@ async def ksc_get_policy(policy_id: int) -> dict:
 )
 async def ksc_get_outbreak_policies() -> dict:
     """Outbreak-Policies lesen (Policy.GetOutbreakPolicies)."""
-    return await policies_tools.get_outbreak_policies(get_client())
+    async with use_client() as client:
+        return await policies_tools.get_outbreak_policies(client)
 
 
 @mcp.tool(
@@ -393,7 +482,8 @@ async def ksc_query_events(
     offset: int = 0,
 ) -> dict:
     """Freie Event-Abfrage mit Filter (CreateEventProcessing2, paginiert). Filter-Attribute siehe Doku a00134."""
-    return await events_tools.query_events(get_client(), event_filter, fields, order, limit, offset)
+    async with use_client() as client:
+        return await events_tools.query_events(client, event_filter, fields, order, limit, offset)
 
 
 @mcp.tool(
@@ -416,9 +506,10 @@ async def ksc_query_host_events(
     offset: int = 0,
 ) -> dict:
     """Events eines Hosts mit Filter lesen (CreateEventProcessingForHost2, paginiert)."""
-    return await events_tools.query_host_events(
-        get_client(), hostname, product, version, event_filter, fields, order, limit, offset
-    )
+    async with use_client() as client:
+        return await events_tools.query_host_events(
+            client, hostname, product, version, event_filter, fields, order, limit, offset
+        )
 
 
 # Re-export für Tests / Doku, damit _READ_ONLY nicht als ungenutzt gilt.
@@ -433,7 +524,11 @@ def main() -> None:
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     if args.http:
-        mcp.run(transport="streamable-http", host=args.host, port=args.port)
+        import uvicorn
+
+        app = mcp.streamable_http_app()
+        app.add_middleware(KscAuthMiddleware)
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     else:
         mcp.run(transport="stdio")
 

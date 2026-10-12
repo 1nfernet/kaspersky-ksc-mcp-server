@@ -1,8 +1,13 @@
 {
+  "_comment": "Devin Desktop/CLI, HTTP variant. Variant A (primary, per-user): put YOUR OWN credentials in headers below -- either raw components (server builds KSCBasic internally, no Base64 by hand) or one verbatim X-KSC-Authorization value (format: KSCBasic user=\"<b64>\", pass=\"<b64>\", internal=\"<0|1>\" with domain=\"<b64>\" for domain users, or KSCT <token>; verbatim wins if both are set; no one-time CreateToken tokens -- 3 min, single use); server runs with KSC_PER_REQUEST_AUTH=1 (fail-closed without header). Optional extra header X-KSC-VServer with the Base64 virtual-server name. Component values must be printable ASCII (clients reject the rest); non-ASCII credentials must be pre-Base64-encoded via the verbatim variant. Variant B (fallback, service account): delete the headers block and run the server with a dedicated read-only KSC service account in its ENV (flag off). Never commit real secrets: personal values belong in user/local scope, not in shared project configs. The MCP server is intranet-only (no internet exposure).",
   "mcpServers": {
     "kaspersky-ksc": {
       "url": "http://localhost:8000/mcp",
-      "transport": "http"
+      "transport": "http",
+      "headers": {
+        "X-KSC-User": "YOUR-OWN-KSC-USER",
+        "X-KSC-Password": "YOUR-OWN-KSC-PASSWORD"
+      }
     }
   }
 }

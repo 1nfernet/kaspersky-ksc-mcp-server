@@ -10,6 +10,21 @@ def _b64(s: str) -> str:
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
+def build_ksc_basic(user: str, password: str, domain: str = "", internal: bool = False) -> str:
+    """Baut den KSCBasic-Authorization-Wert (Single Source of Truth).
+
+    Wird von KscConfig.auth_header() und vom Komponenten-Header-Pfad
+    (auth.py) gemeinsam genutzt — beide liefern byte-identische Strings.
+    """
+    u = _b64(user)
+    p = _b64(password)
+    if internal or not domain:
+        flag = "1" if internal else "0"
+        return f'KSCBasic user="{u}", pass="{p}", internal="{flag}"'
+    d = _b64(domain)
+    return f'KSCBasic user="{u}", pass="{p}", domain="{d}", internal="0"'
+
+
 @dataclass(frozen=True)
 class KscConfig:
     host: str
@@ -34,12 +49,7 @@ class KscConfig:
     def auth_header(self) -> str:
         if self.use_token_auth:
             return f"KSCT {self.token.strip()}"
-        u = _b64(self.user)
-        p = _b64(self.password)
-        if self.internal or not self.domain:
-            return f'KSCBasic user="{u}", pass="{p}", internal="1"' if self.internal else f'KSCBasic user="{u}", pass="{p}", internal="0"'
-        d = _b64(self.domain)
-        return f'KSCBasic user="{u}", pass="{p}", domain="{d}", internal="0"'
+        return build_ksc_basic(self.user, self.password, self.domain, self.internal)
 
     def vserver_header(self) -> str | None:
         if self.vserver and self.vserver.strip():
@@ -58,7 +68,7 @@ class KscConfig:
         return raw.strip()  # Pfad zur .cer
 
     @classmethod
-    def from_env(cls, env: dict | None = None) -> KscConfig:
+    def from_env(cls, env: dict | None = None, require_auth: bool = True) -> KscConfig:
         e = env if env is not None else os.environ
         host = (e.get("KSC_HOST") or "").strip()
         if not host:
@@ -85,6 +95,6 @@ class KscConfig:
             verify=cls._parse_verify(e.get("KSC_VERIFY")),
             timeout=timeout,
         )
-        if not cfg.use_token_auth and not cfg.user:
+        if require_auth and not cfg.use_token_auth and not cfg.user:
             raise ValueError("Weder KSC_TOKEN noch KSC_USER gesetzt — eine Auth-Methode ist erforderlich")
         return cfg

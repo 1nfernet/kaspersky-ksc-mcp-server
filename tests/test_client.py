@@ -22,6 +22,17 @@ def test_config_basic_auth_header():
     assert 'internal="0"' in h
 
 
+def test_ksc_error_str_leaks_no_internals():
+    from ksc_mcp.ksc_client import KscError
+
+    e = KscError(code=1, module="M", message="oops", file="/secret/path.cpp",
+                 line=42, raw={"nested": "secret"})
+    s = str(e)
+    assert "oops" in s
+    assert "/secret/path.cpp" not in s
+    assert "secret" not in s.replace("oops", "")
+
+
 def test_config_token_has_priority():
     cfg = KscConfig(host="ksc.test", user="u", password="p", token="abc123")
     assert cfg.use_token_auth

@@ -10,6 +10,27 @@ log = logging.getLogger(__name__)
 
 DEFAULT_LIFETIME = 100
 MAX_PAGE = 5000
+# Sicherheitsbremse für sequenzielle Scan-Schleifen (ein HTTPS-Call pro
+# Eintrag): schützt KSC + MCP-Client-Timeouts bei grossen Resultsets.
+MAX_SCAN = 1000
+
+
+def as_record_list(value: Any) -> list:
+    """Normalisiert Iterator-Antworten zu einer Liste.
+
+    KSC liefert Records als {"KLCSP_ITERATOR_ARRAY": [...]}. Ein einzelner
+    Record ohne Hülle (nach Decode ein schlichtes Feld-Dict) wird als
+    Ein-Element-Liste gewrappt statt still verworfen; alles andere -> [].
+    """
+    decoded = decode_value(value)
+    if isinstance(decoded, dict):
+        if "KLCSP_ITERATOR_ARRAY" in decoded:
+            items = decoded["KLCSP_ITERATOR_ARRAY"]
+            return items if isinstance(items, list) else [items]
+        return [decoded] if decoded else []
+    if isinstance(decoded, list):
+        return decoded
+    return [decoded] if decoded else []
 
 
 async def fetch_via_chunk_accessor(
@@ -39,14 +60,7 @@ async def fetch_via_chunk_accessor(
             "ChunkAccessor.GetItemsChunk",
             {"strAccessor": accessor, "nStart": offset, "nCount": end - offset},
         )
-        raw = chunk.get("pChunk", {})
-        raw = decode_value(raw)
-        if isinstance(raw, dict):
-            items = raw.get("KLCSP_ITERATOR_ARRAY", [])
-        elif isinstance(raw, list):
-            items = raw
-        else:
-            items = []
+        items = as_record_list(chunk.get("pChunk", {}))
         return {"total": total, "items": items, "offset": offset, "limit": limit}
     finally:
         try:
@@ -89,13 +103,7 @@ async def fetch_via_srvview(
         rng = await client.call("SrvView.GetRecordRange", {
             "wstrIteratorId": iterator_id, "nStart": offset, "nEnd": end,
         })
-        records = decode_value(rng.get("pRecords", {}))
-        if isinstance(records, dict):
-            items = records.get("KLCSP_ITERATOR_ARRAY", [])
-        elif isinstance(records, list):
-            items = records
-        else:
-            items = []
+        items = as_record_list(rng.get("pRecords", {}))
         return {"total": total, "items": items, "offset": offset, "limit": limit}
     finally:
         try:
@@ -109,12 +117,14 @@ async def fetch_via_task_list(
     reset_params: dict,
     limit: int = 50,
     offset: int = 0,
-    max_scan: int = MAX_PAGE,
+    max_scan: int = MAX_SCAN,
 ) -> dict[str, Any]:
     """Tasks.ResetTasksIterator -> GetNextTask-Schleife -> ReleaseTasksIterator.
 
     Die Schleife endet laut Doku, sobald pTaskData leer ist. Es wird nur so
-    weit gelesen wie fuer offset+limit noetig (max. max_scan Eintraege).
+    weit gelesen wie fuer offset+limit noetig (max. max_scan Eintraege, Bremse
+    gegen Last auf KSC + MCP-Timeouts). Ohne Abbruch ist total exakt, sonst
+    total=None (unbekannt) bei truncated=True.
     """
     limit = max(1, min(limit, MAX_PAGE))
     offset = max(0, offset)
@@ -126,20 +136,18 @@ async def fetch_via_task_list(
     try:
         collected: list[Any] = []
         need = offset + limit
-        truncated = False
-        while len(collected) < min(need, max_scan):
+        cap = max(1, min(need, max_scan))
+        exhausted = False
+        while len(collected) < cap:
             nxt = await client.call("Tasks.GetNextTask", {"strTaskIteratorId": iterator_id})
             data = decode_value(nxt.get("pTaskData", {}))
             if not data:
+                exhausted = True
                 break
             collected.append(data)
-        else:
-            # Schleife lief bis ans Cap -> ggf. existieren weitere Eintraege
-            truncated = True
-        total = len(collected)
-        # Falls ohne Abbruch das Ende erreicht wurde, ist total exakt
+        truncated = not exhausted
         return {
-            "total": total,
+            "total": len(collected) if exhausted else None,
             "truncated": truncated,
             "tasks": collected[offset:offset + limit],
             "offset": offset,
@@ -170,13 +178,7 @@ async def fetch_via_event_processing(
         rng = await client.call("EventProcessing.GetRecordRange", {
             "strIteratorId": iterator_id, "nStart": offset, "nEnd": end,
         })
-        events = decode_value(rng.get("pParamsEvents", {}))
-        if isinstance(events, dict):
-            items = events.get("KLCSP_ITERATOR_ARRAY", [])
-        elif isinstance(events, list):
-            items = events
-        else:
-            items = [events] if events else []
+        items = as_record_list(rng.get("pParamsEvents", {}))
         return {"total": total, "items": items, "offset": offset, "limit": limit}
     finally:
         try:

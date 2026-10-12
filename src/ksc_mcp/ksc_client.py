@@ -213,11 +213,21 @@ def _request_id() -> str:
 class KscClient:
     """Async KSC-Client mit Session-Caching und Read-Only-Guard."""
 
-    def __init__(self, config: KscConfig, http: httpx.AsyncClient | None = None):
+    def __init__(
+        self,
+        config: KscConfig,
+        http: httpx.AsyncClient | None = None,
+        auth_header: str | None = None,
+        vserver_header: str | None = None,
+    ):
         self.config = config
         self._http = http
         self._own_http = http is None
         self._session_id: str | None = None
+        # Pro-Request-Override (ephemere Clients): wird 1:1 an den KSC
+        # durchgeleitet, config bleibt Basis für Host/Port/TLS/Timeout.
+        self._auth_header = auth_header
+        self._vserver_header = vserver_header
 
     async def _http_client(self) -> httpx.AsyncClient:
         if self._http is None:
@@ -239,13 +249,18 @@ class KscClient:
             "X-KSC-RequestId": _request_id(),
         }
         if for_login:
-            h["Authorization"] = self.config.auth_header()
+            h["Authorization"] = self._auth_header or self.config.auth_header()
         elif with_session and self._session_id:
             h["X-KSC-Session"] = self._session_id
-        vs = self.config.vserver_header()
+        vs = self._vserver_header or self.config.vserver_header()
         if vs:
             h["X-KSC-VServer"] = vs
         return h
+
+    @property
+    def is_ephemeral(self) -> bool:
+        """True, wenn dieser Client Pro-Request-Credentials trägt (kein Reuse)."""
+        return self._auth_header is not None
 
     async def login(self) -> str:
         http = await self._http_client()

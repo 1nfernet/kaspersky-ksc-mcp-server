@@ -1,13 +1,14 @@
 {
+  "_comment": "Copy the mcpServers entry into %APPDATA%\\Claude\\claude_desktop_config.json. Replace the command path and put YOUR OWN KSC credentials in env (per-user stdio model, see README).",
   "mcpServers": {
     "kaspersky-ksc": {
-      "command": "D:\\Softwareentwicklung\\MCP Server\\kaspersky-ksc-mcp-server\\.venv\\Scripts\\python.exe",
+      "command": "D:\\path\\to\\kaspersky-ksc-mcp-server\\.venv\\Scripts\\python.exe",
       "args": ["-m", "ksc_mcp"],
       "env": {
         "KSC_HOST": "ksc.example.com",
         "KSC_PORT": "13299",
-        "KSC_USER": "api-readonly-user",
-        "KSC_PASS": "change-me",
+        "KSC_USER": "your-own-readonly-user",
+        "KSC_PASS": "your-own-password",
         "KSC_INTERNAL": "0",
         "KSC_VERIFY": "false",
         "KSC_TIMEOUT": "30"

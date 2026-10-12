@@ -1,0 +1,18 @@
+{
+  "_comment": "Devin CLI stdio shape (team-shared, WITHOUT secrets). Each user adds their OWN credentials in .devin/mcp_config.local.json (gitignored). See README.",
+  "mcpServers": {
+    "kaspersky-ksc": {
+      "command": "D:\\path\\to\\kaspersky-ksc-mcp-server\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "ksc_mcp"],
+      "env": {
+        "KSC_HOST": "ksc.example.com",
+        "KSC_PORT": "13299",
+        "KSC_USER": "your-own-readonly-user",
+        "KSC_PASS": "your-own-password",
+        "KSC_INTERNAL": "0",
+        "KSC_VERIFY": "false",
+        "KSC_TIMEOUT": "30"
+      }
+    }
+  }
+}

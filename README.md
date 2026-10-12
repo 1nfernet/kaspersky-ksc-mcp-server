@@ -10,6 +10,10 @@ the JSON-over-HTTPS protocol directly.
 All tools are annotated `readOnlyHint: true, destructiveHint: false,
 idempotentHint: true, openWorldHint: true` (they call an external KSC server
 over the network). Paginated tools return `{total, items|tasks, offset, limit}`.
+`ksc_list_tasks` additionally reports `truncated`: when `true`, `total` is
+`null` (unknown — more entries may exist than fetched). Task listing reads
+sequentially (one HTTPS call per entry, capped at 1000 scanned entries), so
+prefer small `limit` values with `offset` paging over large one-shot queries.
 
 | Tool | Description |
 |---|---|
@@ -21,7 +25,7 @@ over the network). Paginated tools return `{total, items|tasks, offset, limit}`.
 | `ksc_get_host_details` | Bundle: attributes + products + tags + host ID in one call |
 | `ksc_get_host_tags` | Tags of a host by hostname or GUID (`HostTagsApi.GetHostTags`) |
 | `ksc_list_tags` | Tag catalog (`ListTags.GetAllTags`, instance `HostsTags`) |
-| `ksc_list_tasks` | Group tasks (`ResetTasksIterator`/`GetNextTask`); reports `truncated: true` when more entries may exist than fetched |
+| `ksc_list_tasks` | Group tasks (`ResetTasksIterator`/`GetNextTask`); `truncated: true` means `total` is `null` (unknown) |
 | `ksc_get_task` | Task attributes + settings + start event |
 | `ksc_get_task_statistics` | Task counters per state (`GetTaskStatistics2`) |
 | `ksc_get_task_host_status` | Per-host execution states, paginated (`state_mask` bitmask per docs `a00179`, `0x7F` = all states) |
@@ -55,6 +59,86 @@ user/password **or** token auth (token wins when set):
 | `KSC_VSERVER` | — | Virtual server name (optional) |
 | `KSC_VERIFY` | `false` | TLS verification: `false` for self-signed `klserver.cer`, `true`, or path to `.cer` |
 | `KSC_TIMEOUT` | `30` | HTTP timeout in seconds |
+| `KSC_PER_REQUEST_AUTH` | `0` | `1` = HTTP fail-closed with per-request credentials (see below) |
+
+### Credentials per user
+
+The server adopts `KSC_USER` / `KSC_PASS` / `KSC_TOKEN` unchanged from its own
+process environment — no code change was needed for per-user credentials:
+
+- **stdio (recommended for user separation):** whoever's MCP config starts the
+  server process determines the credentials. Each person puts their **own**
+  values in their **own** client config:
+  - Claude Desktop: the `"env"` block in `clients/claude_desktop_config.example.json`
+  - Devin CLI: `"env"` in `.devin/mcp_config.local.json` (gitignored; share only
+    the server shape without secrets via `.devin/mcp_config.json`,
+    see `clients/devin_mcp_stdio.example.json`)
+  - Claude Code: `-e KSC_USER=… -e KSC_PASS=…` flags
+- **Prefer `KSC_TOKEN` over passwords** where your KSC issues *long-lived*
+  tokens (it takes precedence and keeps passwords off disk). **Do not use
+  `Session.CreateToken` tokens here:** the OpenAPI docs define them as
+  *one-time, 3 minutes validity* — dead after the first login/re-auth, and in
+  per-request mode consumed by the very first tool call. Otherwise
+  user/password.
+- **No 2FA accounts:** the client implements no `KSCMFA totp=…` second step —
+  use a service account without 2FA.
+- **Least privilege:** everyone uses their personal KSC account with a
+  read-only role. Never share admin credentials through client configs. Watch
+  password expiry KSC-side for continuous operation.
+
+### Shared HTTP operation (service account)
+
+One container = one environment = **one service account** for all callers.
+Follow Devin's recommendation for shared connections: create a dedicated
+read-only KSC service account for the container. Access control for *who* may
+ask lives at the MCP client; towards the KSC everything appears as the service
+account.
+
+### Per-request authentication (HTTP, `KSC_PER_REQUEST_AUTH=1`)
+
+With the flag enabled, every HTTP request must carry its own KSC credentials —
+no ENV fallback, fail-closed with a clear error otherwise (stdio always uses
+ENV, as there are no headers). Two variants (verbatim wins if both are sent):
+
+- `X-KSC-Authorization`: the KSC auth value verbatim, i.e.
+  `KSCBasic user="<b64>", pass="<b64>", internal="<0|1>"` or `KSCT <token>`.
+  Passed through to `Session.StartSession`, never parsed or logged.
+- **Components (no Base64 by hand):** `X-KSC-User` + `X-KSC-Password`
+  (plus optional `X-KSC-Domain`, `X-KSC-Internal: 1`). The server builds the
+  `KSCBasic` value internally — byte-identical to what `KSC_USER`/`KSC_PASS`
+  in ENV produce. Devin sends these as static `headers`, e.g.:
+  `{"X-KSC-User": "api-user", "X-KSC-Password": "S3cret!"}`. Store them in
+  gitignored local config; Devin's Secrets store is *not* a documented
+  templating source for custom MCP headers.
+- `X-KSC-VServer` (optional): Base64 virtual-server name.
+
+Rules for components: printable ASCII only (standard HTTP clients reject
+non-ASCII header values client-side) — non-ASCII credentials must be
+pre-Base64-encoded via the verbatim variant. Control characters (`\r\n`,
+header injection), empty values and oversized values are rejected.
+
+Exact `KSCBasic` construction (per OpenAPI docs):
+
+```text
+KSCBasic user="<b64>", pass="<b64>", internal="<0|1>"              # internal user (no domain parameter!)
+KSCBasic user="<b64>", pass="<b64>", domain="<b64>", internal="0"  # domain user
+```
+
+Rules: values are UTF-8 → Base64 in double quotes, separated by `, `, **no**
+spaces around `=`. Non-ASCII names must be Base64-encoded first (after that
+everything is ASCII — the server rejects anything else). Example
+(`api-user` / `S3cret!`, internal):
+`KSCBasic user="YXBpLXVzZXI=", pass="UzNjcmV0IQ==", internal="1"` —
+byte-identical to what `KSC_USER`/`KSC_PASS`/`KSC_INTERNAL` in ENV produce.
+
+Each tool call opens its own KSC session and closes it (`EndSession`) when
+done — sessions are never shared across users. Honest limits:
+
+- **TLS/VPN is mandatory** in this mode: passwords travel per request over
+  (plain) HTTP, and this server does not terminate TLS itself — put a reverse
+  proxy with TLS in front or keep it on a trusted network.
+- Without a live KSC only verified up to the login attempt; end-to-end needs
+  real credentials (live smoke pending).
 
 ## Installation & running (local)
 
@@ -76,7 +160,9 @@ Copy-Item .env.example .env   # then fill in KSC_HOST + credentials
 Copy `clients/claude_desktop_config.example.json` into
 `%APPDATA%\Claude\claude_desktop_config.json` (merge the `mcpServers` entry
 if the file exists), replacing the Python path and the `KSC_*` values. Then
-fully restart Claude Desktop (tray icon → quit). Not verified here (Claude
+fully restart Claude Desktop (tray icon → quit). Note: Claude Desktop only
+supports stdio — there is no HTTP involved, so the per-user ENV model from
+“Credentials per user” applies automatically. Not verified here (Claude
 Desktop is not installed on this machine) — report back if the handshake fails.
 
 ### Claude Code
@@ -103,16 +189,27 @@ CLI is not installed on this machine).
 
 ### Devin Desktop
 
-Same MCP configuration as Devin CLI (shared config basis). Verify on your
-machine; the Desktop docs were not reviewed in detail here.
+Same config basis as Devin CLI (`~/.config/devin/mcp_config.json` user scope
+or project `.devin/mcp_config.json`, secrets in `.devin/mcp_config.local.json`).
+Two ways to connect, both local (this MCP is **not** reachable from the
+internet, so Devin Cloud does not apply — see below):
 
-### Devin Cloud (optional)
+- **stdio:** same shape as Devin CLI above, credentials per user via `"env"`.
+- **HTTP:** `url` + `transport: http` as in
+  `clients/devin_mcp_http.example.json`, dedicated credentials per user via the
+  `headers` field (`X-KSC-Authorization`, server with `KSC_PER_REQUEST_AUTH=1`),
+  or no headers with a service-account server (flag off). Personal values stay
+  in user/local scope, never in shared project configs. Desktop behavior not
+  verified here (Devin Desktop is not installed on this machine).
 
-Web UI: **Customize → MCPs → Add custom MCP** (requires the *Manage MCP
-Servers* permission), transport STDIO (command/args/env) or HTTP against a
-Docker-hosted instance below. Honest caveat: a cloud session needs a network
-path (VPN/Outposts) to `KSC_HOST:13299` — without it, no connection. Prefer
-Devin CLI on a KSC-reachable machine.
+### Devin Cloud — not applicable here
+
+Documented for completeness only: Web UI **Customize → MCPs → Add custom MCP**
+would work with transport STDIO or HTTP (see “Connecting via Streamable HTTP”
+for the header variant). It does **not** apply to this deployment because the
+MCP server is intranet-only — a cloud session has no network path to it (that
+would require VPN/Outposts). Use Devin Desktop/CLI on a KSC-reachable machine
+instead.
 
 ## Connecting via Streamable HTTP
 
@@ -122,13 +219,15 @@ Start the server in HTTP mode (local or Docker, see below). The endpoint is:
 http://<host>:8000/mcp
 ```
 
-### Devin Cloud (custom MCP, HTTP transport)
+### Devin Cloud (custom MCP, HTTP transport) — not applicable here
 
-Per the [official Devin MCP docs](https://docs.devin.ai/work-with-devin/mcp):
+Same reason as above (intranet-only server, no path from cloud sessions).
+Kept for reference — per the [official Devin MCP docs](https://docs.devin.ai/work-with-devin/mcp):
 **Customize → MCPs → Add custom MCP**, transport **HTTP**, Server URL
-`http://<docker-host>:8000/mcp`, no authentication (the server itself has no
-auth layer — the KSC credentials live as ENV inside the server process, see
-the security note below). Verify with **Test tools** in the config page.
+`http://<docker-host>:8000/mcp`. Credentials either per user via the
+`headers` field (`X-KSC-Authorization`, server with `KSC_PER_REQUEST_AUTH=1`)
+or via a service-account server (no headers, flag off). Verify with
+**Test tools** in the config page.
 
 ### Devin CLI (HTTP)
 
@@ -147,7 +246,8 @@ claude mcp add --transport http kaspersky-ksc http://<host>:8000/mcp
 ```
 
 Flag syntax not verified here (Claude Code is not installed on this machine);
-check with `claude mcp --help` if it errors.
+check with `claude mcp --help` if it errors. Per-request auth needs the
+client's header option for `X-KSC-Authorization` (likewise unverified).
 
 ### MCP Inspector (HTTP)
 
@@ -164,11 +264,11 @@ client first.
 The HTTP server exposes **no authentication of its own** — anyone who can
 reach the URL can call all 21 (read-only) tools. Therefore:
 
-- bind to localhost only (`127.0.0.1:8000`, the compose default) or put the
-  server behind firewall/VPN;
-- never expose port 8000 to the internet without a reverse proxy with auth in
-  front of it;
-- for Devin Cloud, reachability requires VPN/Outposts anyway (see above).
+- bind to localhost only (`127.0.0.1:8000`, the compose default) or keep the
+  server on a trusted network/VPN — this deployment is intranet-only by
+  design, never exposed to the internet;
+- if that ever changes, put a reverse proxy with TLS + auth in front of port
+  8000 first (mandatory for per-request passwords, which travel per request).
 
 ## Docker
 
@@ -193,7 +293,8 @@ docker compose down
 `env_file`, and restarts the container unless stopped. The container needs a
 network route to `KSC_HOST:13299` (a remote KSC works with default bridge
 networking; no `host` network required). Rebuild after code changes with
-`docker compose up --build`.
+`docker compose up --build`. Pinned production dependencies live in
+`requirements-lock.txt` (`pip freeze` of the tested `.venv`).
 
 ## Security model
 
@@ -208,6 +309,8 @@ networking; no `host` network required). Rebuild after code changes with
   certificate or enable full verification.
 - **Sessions:** authenticated sessions are cached and re-established on
   401/403; no explicit logout on shutdown (server-side expiry applies).
+  Config is loaded once at startup — restart the process (or container)
+  after changing ENV.
 - **Logs** go to stderr only — stdout is reserved for JSON-RPC on stdio.
 
 ## Development
