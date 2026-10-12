@@ -22,7 +22,9 @@ KNOWN_VIEWS = frozenset({
 
 
 def validate_view(view: str) -> str:
-    v = (view or "").strip()
+    if not isinstance(view, str):
+        raise KscError(message=f"Ungueltiger SrvView-Name: {view!r}")
+    v = view.strip()
     if not v or not _VIEW_RE.match(v):
         raise KscError(message=f"Ungueltiger SrvView-Name: {view!r}")
     return v
